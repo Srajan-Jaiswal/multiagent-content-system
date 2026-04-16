@@ -2,10 +2,10 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import settings
+from config.llm_factory import get_llm
 from graph.state import ContentState, ErrorLog
 
 
@@ -18,8 +18,8 @@ class BaseAgent(ABC):
     Abstract base class for all pipeline agents.
 
     Provides:
-    - LLM initialisation with model + token budget configuration
-    - Token-usage tracking with a hard per-agent budget (L1 enforcement)
+    - LLM initialisation via LLM factory (provider-agnostic)
+    - Token-usage tracking with a hard per-agent budget
     - Exponential-backoff retry on every LLM call (L1 transient errors)
     - Markdown code-fence stripping on every LLM response
     - Structured ErrorLog output on failure
@@ -30,19 +30,33 @@ class BaseAgent(ABC):
       L3 — Agent failure: caught in run(), returned as ErrorLog entry
 
     Subclasses are responsible for L2 (degraded output retry with stricter prompt).
-
-    NOTE: For the WriterAgent using Claude Opus in production, override __init__
-    and swap self.llm for ChatAnthropic(model="claude-opus-4-6", ...).
     """
 
-    def __init__(self, name: str, model: str, token_budget: int, max_output_tokens: int = 8192):
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        token_budget: int,
+        max_output_tokens: int = 8192,
+        provider: str | None = None,
+    ):
+        """
+        Args:
+            name:              Agent identifier used in logs and ErrorLog entries
+            model:             Model name (e.g. "gemini-2.5-flash", "claude-opus-4-6")
+            token_budget:      Hard token limit for this agent per pipeline run
+            max_output_tokens: Max tokens the model may generate per call
+            provider:          LLM provider ("gemini" | "anthropic" | "groq").
+                               Defaults to settings.DEFAULT_LLM_PROVIDER.
+        """
         self.name = name
         self.token_budget = token_budget
         self._tokens_used: int = 0
 
-        self.llm = ChatGoogleGenerativeAI(
+        resolved_provider = provider or settings.DEFAULT_LLM_PROVIDER
+        self.llm = get_llm(
+            provider=resolved_provider,
             model=model,
-            google_api_key=settings.GOOGLE_API_KEY,
             max_output_tokens=max_output_tokens,
         )
 
@@ -126,12 +140,30 @@ class BaseAgent(ABC):
     @staticmethod
     def _strip_fences(content: str) -> str:
         """
-        Remove markdown code fences LLMs add despite 'Return only JSON' instructions.
-        Handles both ```json ... ``` and ``` ... ``` variants.
+        Extract clean JSON from LLM responses that may contain:
+        - Markdown code fences (```json ... ```)
+        - Preamble text before the JSON ("Here is the strategy: {...}")
+        - Trailing text after the JSON
+
+        Strategy:
+        1. If ``` fences are present, extract content between them
+        2. Otherwise, slice from the first { or [ to the last matching } or ]
         """
-        if content.startswith("```"):
-            content = content.split("```", 2)[1]
-            if content.startswith("json"):
-                content = content[4:]
-            content = content.rsplit("```", 1)[0].strip()
-        return content
+        # Step 1: strip ``` fences wherever they appear in the string
+        if "```" in content:
+            start = content.find("```")
+            end = content.rfind("```")
+            if start != end:
+                inner = content[start + 3:end]
+                if inner.startswith("json"):
+                    inner = inner[4:]
+                return inner.strip()
+
+        # Step 2: extract JSON object or array by finding outermost braces
+        for open_ch, close_ch in [('{', '}'), ('[', ']')]:
+            start = content.find(open_ch)
+            end = content.rfind(close_ch)
+            if start != -1 and end != -1 and start < end:
+                return content[start:end + 1]
+
+        return content.strip()
