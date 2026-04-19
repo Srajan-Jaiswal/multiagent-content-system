@@ -46,10 +46,10 @@ class SEOAgent(BaseAgent):
     # ── Internal steps ────────────────────────────────────────────────────── #
 
     def _fetch_competitor_data(self, topic: str) -> str:
-        if settings.USE_MOCK_TAVILY:
-            from tests.mocks import MOCK_TAVILY_RESULTS
-            print(f"[ResearchAgent] USE_MOCK_TAVILY=true — skipping live call for query: {query!r}")
-            return _format_tavily_results(MOCK_TAVILY_RESULTS["results"])
+        if settings.USE_MOCK_DATA:
+            from tests.mocks import get_mock_seo_results
+            print(f"[SEOAgent] USE_MOCK_DATA=true — skipping live call for topic: {topic!r}")
+            return _format_tavily_results(get_mock_seo_results())
 
         tavily = TavilySearch(
             api_key=settings.TAVILY_API_KEY,

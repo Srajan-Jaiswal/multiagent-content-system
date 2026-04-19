@@ -66,10 +66,7 @@ class ErrorLog(TypedDict):
     error: str
     timestamp: str
 
-
-# --------------------------------------------------------------------------- #
 #  Central shared state
-# --------------------------------------------------------------------------- #
 
 class ContentState(TypedDict):
     # ── User inputs ──────────────────────────────────────────────────────── #
@@ -107,5 +104,6 @@ class ContentState(TypedDict):
     publishing_results: Annotated[list[PublishResult], operator.add]
 
     # ── Pipeline meta ────────────────────────────────────────────────────── #
+    job_id: str                    # unique run identifier (used as ChromaDB filter)
     status: str                    # e.g. "researching" | "writing" | "review" | "done"
     errors: Annotated[list[ErrorLog], operator.add]
