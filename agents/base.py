@@ -1,3 +1,4 @@
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
@@ -141,15 +142,20 @@ class BaseAgent(ABC):
     def _strip_fences(content: str) -> str:
         """
         Extract clean JSON from LLM responses that may contain:
+        - <think>...</think> reasoning blocks (Qwen/R1-style models)
         - Markdown code fences (```json ... ```)
-        - Preamble text before the JSON ("Here is the strategy: {...}")
+        - Preamble text before the JSON
         - Trailing text after the JSON
 
         Strategy:
-        1. If ``` fences are present, extract content between them
-        2. Otherwise, slice from the first { or [ to the last matching } or ]
+        1. Remove <think>...</think> reasoning blocks
+        2. If ``` fences are present, extract content between them
+        3. Otherwise, pick whichever of { or [ appears first and slice to its matching close
         """
-        # Step 1: strip ``` fences wherever they appear in the string
+        # Step 1: strip reasoning blocks emitted by Qwen / R1-family models
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+        # Step 2: strip ``` fences wherever they appear
         if "```" in content:
             start = content.find("```")
             end = content.rfind("```")
@@ -157,13 +163,16 @@ class BaseAgent(ABC):
                 inner = content[start + 3:end]
                 if inner.startswith("json"):
                     inner = inner[4:]
-                return inner.strip()
+                content = inner.strip()
 
-        # Step 2: extract JSON object or array by finding outermost braces
-        for open_ch, close_ch in [('{', '}'), ('[', ']')]:
-            start = content.find(open_ch)
+        # Step 3: extract JSON by picking whichever delimiter opens first
+        obj_start = content.find('{')
+        arr_start = content.find('[')
+        candidates = [(i, c) for i, c in [(obj_start, '}'), (arr_start, ']')] if i != -1]
+        if candidates:
+            start, close_ch = min(candidates, key=lambda x: x[0])
             end = content.rfind(close_ch)
-            if start != -1 and end != -1 and start < end:
+            if end != -1 and start < end:
                 return content[start:end + 1]
 
         return content.strip()

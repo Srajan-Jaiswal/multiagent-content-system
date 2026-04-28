@@ -1,86 +1,116 @@
 import json
-from datetime import datetime
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.tools.tavily_search import TavilySearchResults
-from tenacity import retry, stop_after_attempt, wait_exponential
+from langchain_tavily import TavilySearch
 
+from agents.base import BaseAgent
 from config import prompts, settings
-from graph.state import ContentState, ErrorLog, ResearchItem
+from graph.state import ContentState, ResearchItem
+from rag import VectorStore
+from utils import _format_tavily_results
+
+
+class ResearchAgent(BaseAgent):
+    """
+    Research Agent — searches the web and builds a structured knowledge base.
+
+    Phase 1 (current): Tavily web search only.
+    Phase 2 (planned): Add Exa semantic search and merge both result sets.
+
+    Writes to: state["research"], state["status"], state["errors"]
+    """
+
+    def __init__(self):
+        super().__init__(
+            name="research_agent",
+            provider=settings.RESEARCH_PROVIDER,
+            model=settings.RESEARCH_MODEL,
+            token_budget=50_000,
+        )
+
+    # ── Public interface ──────────────────────────────────────────────────── #
+
+    def run(self, state: ContentState) -> dict:
+        self._tokens_used = 0  # reset per pipeline run
+        print("[ResearchAgent] Starting research...")
+
+        try:
+            raw_results = self._search(state["topic"], state["audience"])
+            research_items = self._synthesize(raw_results, state["topic"], state["audience"])
+
+            # L2 — degraded output: fewer items than required, retry with broader query
+            if not self._validate_output(research_items):
+                print("[ResearchAgent] Too few results, retrying with broader query...")
+                raw_results = self._search(state["topic"], audience=None)
+                research_items = self._synthesize(raw_results, state["topic"], state["audience"])
+
+            print(f"[ResearchAgent] Collected {len(research_items)} research items. "
+                  f"Tokens used: {self._tokens_used:,}")
+
+            stored = self._store_in_vectordb(research_items, state["job_id"])
+            print(f"[ResearchAgent] Stored {stored} items in ChromaDB (job={state['job_id']})")
+
+            return {
+                "research": research_items,
+                "status": "researched",
+            }
+
+        except Exception as e:
+            print(f"[ResearchAgent] Error: {e}")
+            return {
+                "errors": [self._error_log(e)],
+                "status": "research_failed",
+            }
+
+    def _validate_output(self, output: list[ResearchItem]) -> bool:
+        if len(output) < settings.MIN_RESEARCH_SOURCES:
+            return False
+        return all(bool(item.get("source_url", "").strip()) for item in output)
+
+    # ── Internal steps ────────────────────────────────────────────────────── #
+
+    def _search(self, topic: str, audience: str | None) -> str:
+        query = f"{topic} for {audience}" if audience else topic
+
+        if settings.USE_MOCK_DATA:
+            from tests.mocks import get_mock_results
+            print(f"[ResearchAgent] USE_MOCK_DATA=true — skipping live call for query: {query!r}")
+            return _format_tavily_results(get_mock_results()["results"])
+
+        tavily = TavilySearch(
+            api_key=settings.TAVILY_API_KEY,
+            max_results=settings.MIN_RESEARCH_SOURCES,
+        )
+        results = tavily.invoke(query)
+        return _format_tavily_results(results)
+
+    @staticmethod
+    def _store_in_vectordb(items: list[ResearchItem], job_id: str) -> int:
+        try:
+            store = VectorStore()
+            return store.store(items, job_id)
+        except Exception as e:
+            print(f"[ResearchAgent] ChromaDB store failed (non-fatal): {e}")
+            return 0
+
+    def _synthesize(self, search_results: str, topic: str, audience: str) -> list[ResearchItem]:
+        messages = [
+            {"role": "system", "content": prompts.RESEARCH_SYSTEM},
+            {
+                "role": "user",
+                "content": prompts.RESEARCH_USER.format(
+                    topic=topic,
+                    audience=audience,
+                    search_results=search_results,
+                    min_sources=settings.MIN_RESEARCH_SOURCES,
+                ),
+            },
+        ]
+        content = self._invoke(messages)
+        return json.loads(content)
+
+
+_agent = ResearchAgent()
 
 
 def run(state: ContentState) -> dict:
-    """
-    Research Agent — searches the web and builds a structured knowledge base.
-    Writes to: state["research"], state["status"], state["errors"]
-    """
-    print("[ResearchAgent] Starting research...")
-
-    try:
-        raw_results = _search(state["topic"], state["audience"])
-        research_items = _synthesize(raw_results, state["topic"], state["audience"])
-
-        print(f"[ResearchAgent] Collected {len(research_items)} research items.")
-        return {
-            "research": research_items,
-            "status": "researched",
-        }
-
-    except Exception as e:
-        error: ErrorLog = {
-            "agent": "ResearchAgent",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        print(f"[ResearchAgent] Error: {e}")
-        return {"errors": [error], "status": "research_failed"}
-
-
-@retry(stop=stop_after_attempt(settings.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _search(topic: str, audience: str) -> str:
-    """Run Tavily search and return raw results as a formatted string."""
-    tavily = TavilySearchResults(
-        api_key=settings.TAVILY_API_KEY,
-        max_results=settings.MIN_RESEARCH_SOURCES,
-    )
-    results = tavily.invoke(f"{topic} for {audience}")
-
-    # Flatten into a readable block for the LLM
-    formatted = []
-    for r in results:
-        formatted.append(f"URL: {r.get('url', 'N/A')}\nContent: {r.get('content', '')}\n")
-    return "\n---\n".join(formatted)
-
-
-def _synthesize(search_results: str, topic: str, audience: str) -> list[ResearchItem]:
-    """Ask Claude Sonnet to extract and structure research items from raw search results."""
-
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=settings.GOOGLE_API_KEY,
-        max_output_tokens=8192,
-    )
-
-    messages = [
-        {"role": "system", "content": prompts.RESEARCH_SYSTEM},
-        {
-            "role": "user",
-            "content": prompts.RESEARCH_USER.format(
-                topic=topic,
-                audience=audience,
-                search_results=search_results,
-                min_sources=settings.MIN_RESEARCH_SOURCES,
-            ),
-        },
-    ]
-
-    response = llm.invoke(messages)
-    content = response.content.strip()
-    # Strip markdown code fences that LLMs sometimes add despite instructions
-    if content.startswith("```"):
-        content = content.split("```", 2)[1]
-        if content.startswith("json"):
-            content = content[4:]
-        content = content.rsplit("```", 1)[0].strip()
-    return json.loads(content)
+    return _agent.run(state)
